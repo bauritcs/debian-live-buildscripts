@@ -1,0 +1,394 @@
+#!/bin/bash
+
+cleanup () 
+{ # discard contents of tmpfs, umount if necessary
+	if [ -n "$NTFSROOT" ]; then
+		echo "Removing '$TEMPDIR/*'."
+		rm -rf $TEMPDIR/*
+	else
+		echo "Unmounting '$TEMPDIR'."
+		umount $TEMPDIR
+	fi
+	if rmdir $TEMPDIR; then
+		echo "Removed empty directory '$TEMPDIR'."
+	else
+		echo "Could not remove directory '$TEMPDIR'."
+	fi
+	if [ -n "$NTFSROOT" ]; then
+		if umount $MOUNTPOINT; then
+			echo "Unmounted '$MOUNTPOINT'."
+		else
+			echo "Could not unmount '$MOUNTPOINT'."
+		fi
+	fi
+}
+
+AutoUpdateMain ()
+{
+# Output startup message
+#
+echo -n " autoupdater (backgrounding update task)"
+
+
+# Background everything
+#
+(
+
+
+# redirect all output to console #10
+#
+exec >/dev/tty10 2>&1
+
+
+# clear console
+#
+clear
+
+
+# This is so grep, awk and sed will match the right terms regardless of LANG
+#
+unset LANG
+unset LC_ALL
+unset LC_MESSAGES
+
+
+# download url pointing to directory with all required files goes here
+DOWNLOADURL=$(cat /proc/cmdline | \
+               tr ' ' '\n' | \
+               awk -F'=' ' /^updateurl=/ { print $2 }')
+
+if [ -z "$\DOWNLOADURL" ]; then
+	echo "No update URL. Exiting."
+	return 0
+fi
+
+# Bandwidth limit goes here
+#
+#BWLIMITPERCENT=20 # in percent, numeric-only
+BWLIMITPERCENT=$(cat /proc/cmdline | \
+                        tr ' ' '\n' | \
+                        awk -F'=' ' /^bwlimit=/ { print $2 }')
+if [ -z "$\BWLIMITPERCENT" ]; then 
+	BWLIMITPERCENT=20
+	echo "Bandwidth limit not set. Defaulting to 20%."
+fi
+
+
+
+# sleeping a random amount of time to ease load on the update server
+#
+SLEEPTIME=0
+echo -n "Calculating random update delay (120-900 seconds)..."
+while [ $SLEEPTIME -lt 120 ]; do 
+	echo -n "."
+	# During startup, script is run with /bin/sh, 
+	# even when #!/bin/bash is set,
+	# so we need to improvise.
+	RND=$(/bin/bash -c 'echo $RANDOM')
+	SLEEPTIME=$((RND%900))
+done
+echo " "
+echo "Sleeping for $SLEEPTIME seconds ..."
+sleep $SLEEPTIME
+
+
+# Define our mountpoint and check if we're capable of auto-updating
+NTFSROOT=$(cat /proc/cmdline | tr ' ' '\n' | awk -F '=' '/^ntfs-uuid/ { print $2 }')
+if [ -n "$NTFSROOT" ]; then
+	mkdir -p /lib/live/mount/ntfsroot
+	mount -t ntfs-3g -rw /dev/disk/by-uuid/$NTFSROOT /lib/live/mount/ntfsroot
+	MOUNTPOINT="/lib/live/mount/ntfsroot/"
+	# create a temporary directory
+	TEMPDIR=$(mktemp -d --tmpdir=$MOUNTPOINT)
+else
+	MOUNTPOINT="/lib/live/mount/findiso/"
+	# create a temporary directory and mount a tmpfs there
+	TEMPDIR=$(mktemp -d --tmpdir=/mnt)
+	IMGSIZE=$(df /lib/live/mount/medium | awk ' /medium/ { print $2}')
+	mount -t tmpfs -osize=$((IMGSIZE*15/10))k tmpfs $TEMPDIR
+
+fi
+if ! (	[ -d "$MOUNTPOINT/boot/live-download" ] && \
+	( \
+		[ -d "$MOUNTPOINT/boot/live1" ] || \
+		[ -d "$MOUNTPOINT/boot/live2" ] \
+	) \
+     ); then
+	[ -n "$NTFSROOT" ] && umount $MOUNTPOINT
+	echo "No directories suitable for update."
+	return 0 # directories missing, most likely not a writeable medium
+fi
+
+
+# define and figure out some paths that we will be needing later on
+#
+if [ -f "$MOUNTPOINT/syslinux.cfg" ]; then
+	SYSLINUXPATH="$MOUNTPOINT/"
+elif [ -f "$MOUNTPOINT/syslinux/syslinux.cfg" ]; then
+	SYSLINUXPATH="$MOUNTPOINT/syslinux/"
+elif [ -f "$MOUNTPOINT/menu.lst" ]; then
+	GRUBPATH="$MOUNTPOINT/"
+elif  [ -f "$MOUNTPOINT/boot/menu.lst" ]; then
+	GRUBPATH="$MOUNTPOINT/grub/"
+elif  [ -f "$MOUNTPOINT/boot/grub/menu.lst" ]; then
+	GRUBPATH="$MOUNTPOINT/boot/grub/"
+else
+	[ -n "$NTFSROOT" ] && umount $MOUNTPOINT
+	echo "No suitable bootloader found."
+	return 1
+fi
+
+RUNNINGSYSTEMFULLPATH=$(dirname $(readlink -m "$MOUNTPOINT/$(cat /proc/cmdline | \
+                        tr ' ' '\n' | \
+                        awk -F'=' ' /^findiso=/ { print $2 }')"))
+
+ALLSYSTEMSROOT=$(dirname $RUNNINGSYSTEMFULLPATH)
+RUNNINGSYSTEMNAME=$(basename $RUNNINGSYSTEMFULLPATH)
+if [ "$RUNNINGSYSTEMNAME" = "live1" ]; then
+	OTHERSYSTEMNAME="live2"
+elif [ "$RUNNINGSYSTEMNAME" = "live2" ]; then
+	OTHERSYSTEMNAME="live1"
+else
+	[ -n "$NTFSROOT" ] && umount $MOUNTPOINT
+	echo "Unable to determine path/name of running system."
+	return 1
+fi
+OTHERSYSTEMFULLPATH=$(readlink -m "$ALLSYSTEMSROOT/$OTHERSYSTEMNAME")
+DOWNLOADPATH=$(readlink -m "$ALLSYSTEMSROOT/live-download/")
+
+
+# Now we'll copy the content of the live-download folder to our tempdir
+# this is so we can run wget in update mode (-N) or rsync without needing
+# write access to our boot medium (write access means increased wear and tear,
+# and we want to avoid that especially for media that has no wear-leveling
+# like CF cards)
+#
+while ! rsync -aPv --inplace --modify-window=1 $DOWNLOADPATH/ $TEMPDIR; do
+	echo "Sleeping 30 seconds ..."
+	sleep 30
+	echo "Retrying ..."
+done
+
+
+# Now let's figure out if we're supposed to use wget or rsync for downloading
+#
+if echo "$DOWNLOADURL" | grep -q "^http" || \
+   echo "$DOWNLOADURL" | grep -q "^ftp"
+   then
+	# Attempt to determine available bandwidth & to set BWLIMIT accordingly
+	wget -Nr -o /tmp/dl.log -P /tmp/ -nd \
+		--progress=bar:force $DOWNLOADURL/initrd.img 
+	cp --update "/tmp/initrd.img" "$TEMPDIR"
+	rm "/tmp/initrd.img"
+	SIZEFACTORSTRING=$(	awk -F' |\(|\)' ' $9 == "saved" && \
+				$7 == "-" { print $5 }' /tmp/dl.log \
+			   )
+	case $SIZEFACTORSTRING in
+		"" | \
+		[0-9]) 	echo -n "Not enough Bandwidth for update task - "
+			echo -n "aborting."
+			cleanup
+			return 0
+			;;
+                "KB/s") SIZEFACTOR=1;;
+                "MB/s") SIZEFACTOR=1024;;
+                "GB/s") SIZEFACTOR=1048576;;
+		*)     	SIZEFACTOR=$((1024*1024*1024));;
+	esac
+	DLRATE=$(	awk -F' |\(|\)' ' $9 == "saved" && $7 == "-" \
+			{ print $4 }' /tmp/dl.log \
+                 )
+	BWLIMIT=$(	echo "$DLRATE $SIZEFACTOR $BWLIMITPERCENT" | \
+			awk ' { print $1*$2*$3/100 }' | \
+			awk -F'.' '{ print $1 }' \
+		  ) # outputs integer kilobytes, not rounded
+	echo "Determined bandwidth limit: '$BWLIMIT KB/s'"
+	DOWNLOADCOMMAND="wget -Nr -l 1 -nd -P "$TEMPDIR" \
+			  --limit-rate=${BWLIMIT}k $DOWNLOADURL"
+
+elif echo "$DOWNLOADURL" | grep -q "^rsync"; then
+
+	rsync -hh -aPv -W --inplace --log-file=/tmp/dl.log $DOWNLOADURL/initrd.img \
+		$TEMPDIR/initrd.img.new
+	mv $TEMPDIR/initrd.img.new $TEMPDIR/initrd.img
+	SIZEFACTORSTRING=$(	sed -e's_\(. bytes/sec\)_ \1_' /tmp/dl.log | \
+				awk '$4 == "sent" && $12 == "bytes/sec" \
+				{ print $11 }' \
+			   )
+	case $SIZEFACTORSTRING in
+		"" | \
+		[0-9]) 	echo -n "Not enough Bandwidth for update task - "
+			echo -n "aborting."
+			cleanup
+			return 0
+			;;
+		"K")   	SIZEFACTOR=1;;
+		"M")   	SIZEFACTOR=1024;;
+		"G")   	SIZEFACTOR=$((1024*1024));;
+		*)     	SIZEFACTOR=$((1024*1024*1024));;
+	esac
+	DLRATE=$(	sed -e's_\(. bytes/sec\)_ \1_' /tmp/dl.log | \
+			awk '$4 == "sent" && $12 == "bytes/sec" \
+			{ print $10 }')
+	BWLIMIT=$(	echo "$DLRATE $SIZEFACTOR $BWLIMITPERCENT" | \
+			awk ' { print $1*$2*$3/100 }' | \
+			awk -F'.' '{ print $1 }' \
+		  ) # outputs integer kilobytes, not rounded
+	echo "Determined bandwidth limit: '$BWLIMIT KB/s'"
+	DOWNLOADCOMMAND="rsync -aPv --inplace --bwlimit=$BWLIMIT $DOWNLOADURL/ \
+			  $TEMPDIR"
+else 
+	[ -n "$NTFSROOT" ] && umount $MOUNTPOINT
+	echo "Unsupported download mechanism."
+	return 1
+fi
+rm /tmp/dl.log
+
+
+# Proceed to download from update location
+#
+while ! $DOWNLOADCOMMAND; do
+	echo "Sleeping 30 seconds ..."
+	sleep 30
+	echo "Retrying ..."
+done
+
+# Now check if these files are different from what we already have in our
+# download directory on the boot medium
+#
+echo "Diff'ing '$DOWNLOADPATH' '$TEMPDIR' ..."
+if diff -q $DOWNLOADPATH $TEMPDIR \
+	>/dev/null
+
+	then
+	cleanup
+	echo "Nothing to do. - Files on server not newer than '$DOWNLOADPATH'."
+	return 0 	# current is newest, nothing to do, we want to avoid
+			# unneccessary writes to the medium
+else
+	echo "Differences detected. Continuing ..."
+fi
+
+
+# If we made it past that point, it's time to update the boot medium, so let's
+# remount it rw and async for speed
+#
+if mount -oremount,rw,async $MOUNTPOINT; then
+	echo "Remounted '$MOUNTPOINT' as rw and async."
+else
+	echo "Could not remount '$MOUNTPOINT' as rw and async."
+fi
+
+
+# Now, we don't want to copy an index.htm(l) file, so let's do away with that
+#
+rm -f $TEMPDIR/index.ht*
+
+
+# move everything over to the boot medium
+#
+echo "Moving $TEMPDIR/* => $DOWNLOADPATH"
+mv $TEMPDIR/* $DOWNLOADPATH
+cleanup # FIXME ist dieses Cleanup gerechtfertigt oder macht es dummfoog?
+if [ -n "$NTFSROOT" ]; then
+	echo "NTFSROOT detected. Attempting to mount '/dev/disk/by-uuid/$NTFSROOT'."
+	if mount -t ntfs-3g -rw /dev/disk/by-uuid/$NTFSROOT /lib/live/mount/ntfsroot; then
+		echo "Mount successful."
+	else
+		echo "Failed to mount NTFSROOT."
+	fi
+fi
+
+
+# let's check if we just downloaded a copy of our running system
+#
+echo "Diff'ing '$DOWNLOADPATH' '$RUNNINGSYSTEMFULLPATH'"
+if diff -q $DOWNLOADPATH $RUNNINGSYSTEMFULLPATH >/dev/null && \
+	   [ -d "$OTHERSYSTEMFULLPATH" ] ; then
+	   [ -n "$NTFSROOT" ] && umount $MOUNTPOINT
+	   echo "Nothing to do. Content of $DOWNLOADPATH equals" \
+		"$RUNNINGSYSTEMNAME."
+		return 0 # current is newest, nothing to do, 
+			 # we want to keep the old system in OTHERSYSTEMFULLPATH
+			 # as a fallback
+fi
+
+
+# make sure our destination path really exists
+#
+mkdir -p $OTHERSYSTEMFULLPATH
+
+
+# let's check if our destination is already up to date or needs updating
+#
+echo "Diff'ing '$DOWNLOADPATH' '$OTHERSYSTEMFULLPATH'"
+if diff -q $DOWNLOADPATH $OTHERSYSTEMFULLPATH >/dev/null; then
+		[ -n "$NTFSROOT" ] && umount $MOUNTPOINT
+		echo "Nothing to do - content of '$DOWNLOADPATH' equals"\
+		      "'$OTHERSYSTEMNAME'."
+		return 0 # OTHERSYSTEMFULLPATH is already up to date
+else
+	# keep rsyncing until the update is complete
+	echo "Copying $DOWNLOADPATH/ => $OTHERSYSTEMFULLPATH"
+	while ! rsync -aPv --inplace --modify-window=1 $DOWNLOADPATH/ $OTHERSYSTEMFULLPATH
+		do
+		echo "Sleeping 30 seconds ..."
+		sleep 30
+		echo "Retrying ..."
+	done
+fi
+
+
+# change default boot to the image we just downloaded and installed
+#
+if [ -n "$SYSLINUXPATH" ]; then
+	echo "Changing syslinux default to $OTHERSYSTEMNAME-486."
+	sed -i -e"/^default/cdefault $OTHERSYSTEMNAME-486" \
+		$SYSLINUXPATH/syslinux.cfg
+
+elif [ -n "$GRUBPATH" ]; then
+	MENULST=$GRUBPATH/menu.lst
+	CURRENTDEFAULT=$(awk '/^default/ { print $2 }' $MENULST | tr -d '\r')
+	CURRENTTITLEPOSITION=$(grep '^title' $MENULST | 		grep -n "${RUNNINGSYSTEMNAME}-486" | 		awk -F':' '$2 ~ /'"${RUNNINGSYSTEMNAME}-486"'/ { print $1 }')
+	CURRENTTITLEPOSITION=$((CURRENTTITLEPOSITION-1))
+	OTHERTITLEPOSITION=$(grep '^title' $MENULST | 		grep -n "${OTHERSYSTEMNAME}-486" | 		awk -F':' '$2 ~ /'"${OTHERSYSTEMNAME}-486"'/ { print $1 }')
+	OTHERTITLEPOSITION=$((OTHERTITLEPOSITION-1))
+	if [ "$CURRENTTITLEPOSITION" = "$CURRENTDEFAULT" ]; then
+		echo "Changing GRUB-legacy default to $OTHERTITLEPOSITION ..."
+		sed -i -e"/^default/cdefault $OTHERTITLEPOSITION" \
+			$MENULST
+	else
+		echo "Not changing GRUB-legacy default."
+		echo "Reason: We're at boot position '$CURRENTTITLEPOSITION',"
+		echo "while default is set to position '$CURRENTDEFAULT'."
+	fi
+else
+	echo "Unsupported bootloader."
+fi
+
+# we're on an async mount point, so let's sync to be safe
+#
+sync
+
+
+# umount tempdir to free memory
+#
+if [ -d $TEMPDIR ]; then
+	cleanup
+fi
+
+
+# now, change mount back to ro and sync
+#
+if [ -n "$NTFSROOT" ]; then
+	umount $MOUNTPOINT
+else	
+	mount -oremount,ro,sync $MOUNTPOINT
+fi
+
+) &
+
+}
+
+AutoUpdateMain
+

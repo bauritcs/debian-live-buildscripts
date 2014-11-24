@@ -1,0 +1,109 @@
+#!/bin/bash
+#    (c) 2013-12-13, Stefan Baur <sendspamhere@stefanbaur.de>
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+# Paths go here
+ISONAME='./livecd-tree/binary.hybrid.iso'
+WRITEABLETARGET=$1
+if ! [ -b "$WRITEABLETARGET" ]; then
+	echo "Destination is not a block device, exiting."
+	echo "Please use e.g. '/dev/sdb' as first parameter."
+	exit 1
+fi
+SFDISK4IMAGE='-H64 -S32' # needed for some USB sticks and for image files
+			 # (try to remove this if the write process fails)
+
+if [ -x /usr/bin/which ] ; then
+	for executable in grep dd parted awk sfdisk sed perl buffer partprobe kpartx mkdosfs ; do
+		if ! which $executable >/dev/null; then
+			echo 'Could not find executable "'$executable'". Aborting.'
+			exit 1
+		fi
+	done
+else
+	echo "There is no '/usr/bin/which'. Aborting. Please install 'which' (Debian package 'debianutils')."
+	exit 1
+	
+fi
+
+# sfdisk will complain about a few things
+# when using a file as target instead of a device
+if ! file $WRITEABLETARGET | grep -q ': sticky block special$' ; then
+	echo 'Working on image file.'
+	echo 'Please ignore Messages like:'
+	echo ' * "Warning: <image> is not a block device"'
+	echo ' * "Disk <image>: cannot get geometry"'
+	echo ' * "BLKRRPART: Inappropriate ioctl for device"'
+	echo 'They are to be expected when using an image file as target.'
+fi
+
+echo 'Writing hybridiso data to target.'
+if ! dd if=$ISONAME of=$WRITEABLETARGET conv=notrunc bs=1024k ; then
+	echo 'Unable to write to target. Aborting.'
+	exit 1
+fi
+echo 'Initial write complete.'
+
+DATAPART=$(	parted $WRITEABLETARGET unit s print free | \
+		awk '	$4 == "Free" && $5 == "Space" { print $1 " " $2 } ' | \
+		tail -1 \
+	  )
+if [ -z "$DATAPART" ] || ! parted -s $WRITEABLETARGET	unit s \
+							mkpart primary fat16 \
+							$DATAPART ; then
+	echo 'Error creating second partition. Aborting.'
+	exit 1
+fi
+echo 'Created second partition in free space.'
+
+if ! ( 	sfdisk -uM $SFDISK4IMAGE --dump $WRITEABLETARGET | \
+		sed 	-e "s#${WRITEABLETARGET}1#${WRITEABLETARGET}_#" \
+			-e "s#${WRITEABLETARGET}2#${WRITEABLETARGET}1#" \
+			-e "s#${WRITEABLETARGET}_#${WRITEABLETARGET}2#" | \
+		perl 	-e '	@_ = <STDIN>; 
+				($_[3], $_[4])=($_[4], $_[3]); 
+				print @_ 
+			   ' | \
+		buffer | \
+		sfdisk -uM $SFDISK4IMAGE -q $WRITEABLETARGET >/dev/null
+     ) ; then
+	echo 'Error changing partition order. Aborting.'
+	exit 1
+fi
+echo 'sfdisk complete: swapped partition numbering.'
+
+echo 'Notifying kernel about partition table changes.'
+if ! partprobe $WRITEABLETARGET ; then
+	echo 'Unable to notify kernel about changes. Aborting.'
+	exit 1
+fi
+echo 'Kernel has been notified.'
+
+echo 'Preparing to format second partition.'
+kpartx -a $WRITEABLETARGET 
+LOOPDEV=$( kpartx -l $WRITEABLETARGET | awk '$1 ~ /1$/ { print $1 } ')
+if [ -z "$LOOPDEV" ] || ! mkdosfs /dev/mapper/$LOOPDEV >/dev/null; then
+	echo 'Unable to format second partition. Aborting.'
+	exit 1
+fi
+echo 'Formatting complete.'
+
+echo 'Attempting to un-map partitions...'
+while ! kpartx -d $WRITEABLETARGET 2>/dev/null ; do
+	echo 'Retrying to un-map partitions...'
+	sleep 5
+done
+
+echo 'All done.'

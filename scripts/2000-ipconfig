@@ -1,0 +1,39 @@
+#!/bin/bash
+
+IFConfig ()
+{
+
+# Output startup message
+#
+echo -n " ifconfig"
+
+#setterm -term linux -r >/dev/tty9
+# Make sure no language-specific stuff interferes with our matching
+# grep: highlight everything that matches "inet" to the end of its line
+# and also (-E, |$) show every line that has an end => Everything else
+# Output the result on virtual terminal 9
+cat >/etc/network/if-up.d/showips <<SHOWIPS
+#!/bin/bash
+export TERM=linux;
+
+while ! ip a | grep -v "inet 127.0.0.1" | grep -v "inet6 ::1/128" | grep -q inet ; do
+	sleep 2
+done
+
+IPMSG=\$(LANG=C \
+/sbin/ip a | \
+/bin/grep -P --color=always "inet.*? [\. 0-9a-f:/]*? |$" | \
+GREP_COLOR="1;32" \
+/bin/grep -P --color=always "link/ether .*? |$" ); \
+IPMSG=\$( sed 's/^/- /' <<< "\$IPMSG" ); 
+sed -i '/^- /d' /etc/issue; 
+sed -i '/^- /d' /etc/issue.net; 
+echo "\$IPMSG" >> /etc/issue; 
+echo "\$IPMSG" >> /etc/issue.net 
+SHOWIPS
+
+chmod 755 /etc/network/if-up.d/showips
+
+}
+
+IFConfig

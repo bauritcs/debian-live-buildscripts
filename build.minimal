@@ -1,0 +1,226 @@
+#!/bin/bash
+
+# Check if live-build package is installed
+#
+if ! dpkg -l live-build | grep -q '^ii' ; then
+	echo 'Please run apt-get install live-build first.'
+	exit 1
+fi
+
+
+# First part of localization, also see the part below tagged with the
+# comment '# Actual config part comes here'
+#
+export LH_LANGUAGE="de"
+
+
+# Create builddirectory, if not already present
+#
+mkdir -p livecd-tree
+
+
+# lb clean is not thorough enough. Also, caching seems to be a tad bit too
+# agressive. I've seen strange stuff happen (changes not ending up in the image)
+# after a lb clean. So for good measure, we're purging the entire directory. 
+# lb clean, for example, does not purge lib/live/config.
+# Please use an upstream proxy to minimize your bandwidth usage instead.
+#
+#rm -rf livecd-tree/*
+
+
+# We change to the builddirectory, because that's easier
+#
+cd livecd-tree
+
+
+# Cleanup (pretty mindless, but since someone might want to comment out the
+# radical cleanup job above, we should make sure we're in a state that's 
+# expected by lb config below)
+#
+lb clean
+
+
+# Actual config part comes here
+# Note #1:
+# 'locales=de_DE.UTF-8 keyboard-layouts=de' sets a German keyboard. You might
+# or might not want that. Change it accordingly, and ALSO change the 
+# 'export LH_LANGUAGE' at the very beginning of this script!
+#
+# Note #2:
+# 'live-config.nottyautologin' after 'live-config' disables the autologin
+# on tty1-tty6. This is the ONLY way to do this with debian-live. Do NOT
+# attempt to do something like
+# cp -a /etc/inittab config/includes.chroot/etc/
+# cp -a /etc/inittab config/includes.binary/etc/
+# this WILL NOT WORK.
+#
+# Note #3:
+# 'live-config.noroot' makes sure the user cannot use su/sudo and gain root.
+# The regular user "user" has the password "live".
+#
+# Note #4: 
+# Netbooting via httpfs2 is BROKEN in live-boot, see 
+# http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=707116
+# for the sad state of affairs. For now, you need to use "fetch=", not 
+# "httpfs=", and this means you have to load the entire image to RAM.
+#
+lb config 	-k 486 \
+		--binary-images iso \
+		--debian-installer false \
+		--debian-installer-gui false \
+		­­win32­loader false \
+		--firmware-chroot false \
+		--memtest none \
+		--bootappend-live "	quickreboot \
+					boot=live \
+					silent \
+					live-config.nottyautologin \
+					live-config.noroot \
+					toram \
+					live-config \
+					lang=de \
+					locales=de_DE.UTF-8 \
+					keyboard-layouts=de \
+					consoleblank=0 \
+					quiet \
+				  " \
+		--apt-indices false \
+		--debootstrap-options "--variant=minbase" \
+		--security true \
+		--source false \
+		--apt-recommends false \
+		--archive-areas "main contrib non-free" \
+		--parent-mirror-bootstrap http://http.debian.net/debian \
+		--parent-mirror-chroot http://http.debian.net/debian \
+		--parent-mirror-binary http://http.debian.net/debian \
+		--mirror-bootstrap http://http.debian.net/debian \
+		--mirror-chroot http://http.debian.net/debian \
+		--mirror-binary http://http.debian.net/debian
+
+
+# We need to make sure a few directories exist before copying stuff there
+#
+mkdir -p config/archives
+mkdir -p config/package-lists
+mkdir -p config/includes.chroot/lib/live/config/
+
+
+# Add our ipconfig show script
+#
+cp ../scripts/2000-ipconfig config/includes.chroot/lib/live/config/
+
+
+# Add a password for root so we can log in locally
+# (and remotely, if sshd is installed)
+#
+cp ../scripts/2100-passwd config/includes.chroot/lib/live/config/
+
+
+# Set exec permission
+#
+chmod 755 config/includes.chroot/lib/live/config/*
+
+
+# This locates all the relevant *linux.cfg's 
+# of the various SYSLINUX incarnations (extlinux, isolinux, syslinux, pxelinux)
+# that are used by debian-live. Note: The pxelinux one WILL NOT BE patched.
+#
+for bootloader in $(ls -1d /usr/share/live/build/bootloaders/*) ; do
+	bootloaderbase=$(basename $bootloader)
+	mkdir -p config/includes.binary/$bootloaderbase
+	bootfile=$(ls -1 $bootloader/ | grep linux.cfg | tail -1)
+	[ -f $bootloader/$bootfile ] || continue # not found, move along
+
+	# It's easier to simply overwrite this than patching it
+	echo 'menu title Boot menu' \
+		>config/includes.binary/$bootloaderbase/$bootfile
+	echo 'default live-486' \
+		>>config/includes.binary/$bootloaderbase/$bootfile
+	echo 'prompt 0' >>config/includes.binary/$bootloaderbase/$bootfile
+	echo 'timeout 50' >>config/includes.binary/$bootloaderbase/$bootfile
+	echo 'include live.cfg' \
+	>>config/includes.binary/$bootloaderbase/$bootfile
+done
+
+# Depending on the config options selected, debian-live occasionally "forgets"
+# to include a few required packages, so we make sure they are added again
+# here (adding them again if they're already selected doesn't hurt)
+#
+echo "	net-tools \
+	iputils-ping \
+	ifupdown \
+	isc-dhcp-client \
+	locales \
+	file \
+	user-setup \
+	sudo \
+	rsync \
+	eject \
+	console-setup \
+	console-setup-linux \
+	kbd \
+	keyboard-configuration \
+	xkb-data \
+	vim \
+	vim-common \
+	vim-runtime \
+	libgpm2 \
+	mdadm \
+     " >config/package-lists/recommends.list.chroot
+
+
+# This is needed so we can log into the thinclient remotely
+# (don't forget to set a root password or to add a ssh pubkey)
+#
+echo "  openssh-blacklist \
+        openssh-blacklist-extra \
+        openssh-client \
+        openssh-server \
+	dialog \
+	libpcre3 \
+	readline-common \
+     " >config/package-lists/sshserver.list.chroot
+
+
+# This is so we can support devices that require firmware blobs
+# (this includes ATI Radeon r128 cards, for example)
+#
+echo "	firmware-linux-free \
+	firmware-linux-nonfree \
+     " >config/package-lists/firmware.list.chroot
+
+
+# This is for NTFS filesystem support
+#
+echo "	debconf \
+	libc6 \
+	libfuse2 \
+	libgcrypt11 \
+	libgnutls26 \
+	fuse \
+	ntfs-3g \
+     " >config/package-lists/ntfs.list.chroot
+
+# That's it, we're ready to build, so let's do it and log our progress.
+#
+lb build 2>&1 | tee build.log || exit 1
+
+
+# grab current timestamp in EPOCH format
+#
+DATECODE=$(date +%s)
+
+
+# if odd, add one second (needed to avoid unneccessary downloads, as FAT 
+# always uses even seconds)
+#
+[ $((DATECODE%2)) -ne 0 ] && DATECODE=$((DATECODE+1))
+
+
+# adjust to format required by touch
+#
+DATECODE=$(date -d "@$DATECODE" +%Y%m%d%H%M.%S)
+
+
+# touch all files in download directory with even-seconds-timestamp
+touch -t $DATECODE binary/live/*

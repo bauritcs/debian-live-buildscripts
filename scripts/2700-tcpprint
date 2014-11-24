@@ -1,0 +1,69 @@
+#!/bin/bash
+
+TcpRaw ()
+{
+
+# Output startup message
+#
+echo -n " tcpprint"
+
+# Backgrounding
+(
+
+while ! lsmod | grep -q "^lp"; do
+	# Wait till modprobe lp has occurred
+	# -> this means /dev is fully populated
+	# => USB-Printers can be detected now, too
+	sleep 30
+done
+
+PRINTERDEVICES=""
+[ -d /dev/usb ] && PRINTERDEVICES=$(find /dev/usb -type c -name "lp*" | sort)
+PRINTERDEVICES="$PRINTERDEVICES $(find /dev/ -maxdepth 1 -type c -name "lp*" | sort)"
+
+echo "\nSetting up local printers ..." >>/dev/tty9
+
+# Create a listening port for a TCP/9100-RAW-printer
+#
+# printers may be at /dev/lp_ and at /dev/usb/lp_
+PRINTERCOUNT=0
+for PRINTERDEV in $PRINTERDEVICES; do 
+	PORTNUMBER=$((PRINTERCOUNT+9100))
+	echo "jetdirect${PRINTERCOUNT} ${PORTNUMBER}/tcp" >>/etc/services
+	cat >/etc/xinetd.d/jetdirect${PRINTERCOUNT} << JETDIRCONF 
+service jetdirect${PRINTERCOUNT}
+{
+	socket_type = stream
+	protocol = tcp
+	wait = no
+	user = root
+	server = /bin/dd
+	server_args = if=- of=$PRINTERDEV bs=1024k
+	groups = yes
+	disable = no
+	instances = 1
+	#only_from = 127.0.0.1
+}
+JETDIRCONF
+	echo "Mapping $PRINTERDEV => $PORTNUMBER" >>/dev/tty9
+	PRINTERCOUNT=$((PRINTERCOUNT+1))
+done
+
+echo "#Local printer config: Done." >/etc/xinetd.d/jetdirect
+
+if ps -C xinetd --no-header >/dev/null ; then
+	echo -n "xinetd needs to be restarted, trying to do that ..." >>/dev/tty9
+	if /etc/init.d/xinetd restart; then
+		echo -n " success. All done." >>/dev/tty9
+	else
+		echo -n " error." >>/dev/tty9
+	fi
+else
+	echo -n "No xinetd restart necessary. All done." >>/dev/tty9
+fi
+
+) &
+
+}
+
+TcpRaw

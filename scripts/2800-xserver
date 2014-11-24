@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# Output startup message
+#
+echo -n " preparex"
+
+PrepareX ()
+{
+        /usr/lib/i386-linux-gnu/lightdm/lightdm-set-defaults --autologin user
+        chmod +s /sbin/halt
+
+        # Create .Xsession script with restart loop
+        #
+        cat >/home/user/.Xsession << XSESSIONSCRIPT
+        xset s off
+        xset -dpms
+        matchbox-window-manager &
+	# check if printerconfig is done
+	xterm    \\
+		-title 'Bitte warten ...' \\
+		-e '    while ! [ -f /etc/xinetd.d/jetdirect ]; do
+				dialog \\
+					--sleep 10 \\
+					--infobox "Bitte warten." 0 0 ; \\
+			done \\
+		'
+	PRINTERCOUNT=1
+	PRINTERSTRING=""
+	PRINTERNAMES=\$(awk -F '[= ]' '/server_args/ { print \$7 }' /etc/xinetd.d/jetdirect*)
+	for PRINTERDEV in \$PRINTERNAMES; do
+		PRINTERSTRING="\${PRINTERSTRING}LPT\${PRINTERCOUNT}=\$PRINTERDEV,"
+		PRINTERCOUNT=\$((PRINTERCOUNT+1))
+	done
+	if [ -n "\$PRINTERSTRING" ]; then
+		REDIRPRINTERS="-r lptport:\$PRINTERSTRING"
+	fi
+	rm -f /var/run/shutdown
+        while ! [ -f /var/run/shutdown ]; do
+                rdesktop \\
+                        -u '' \\
+                        -f \\
+                        -r disk:floppy=/mnt/floppy,cdrom=/mnt/cdrom \\
+                        \$REDIRPRINTERS \\
+                        -r clipboard=PRIMARYCLIPBOARD \\
+                        -r sound=local \\
+                        -k de -D -K -z -x l -5 -P \\
+                        \$(awk -F '--' '{ print \$2 }' /proc/cmdline | sed -e 's/^ *tsoptions=//')
+                xterm    \\
+                        -title 'Abschalten?' \\
+                        -e '    SHUTDOWNMODE=\$(      dialog \\
+                                                --timeout 30 \\
+                                                --cancel-label "Zum Login" \\
+                                                --radiolist "Shutdownmenue" 0 0 0 \\
+                                                        "0" "Abschalten" "on" \\
+                                                        "1" "Neu starten" " " \\
+                                                3>&1 1>&2 2>&3 3>&- \\
+                                              ) && \\
+                                if [ "\$SHUTDOWNMODE" = "0" ]; then
+                                        # you have to set the SGID-Bit on /sbin/halt for this to work
+                                        /sbin/poweroff && touch /var/run/shutdown
+                                elif [ "\$SHUTDOWNMODE" = "1" ]; then
+                                        # you have to set the SGID-Bit on /sbin/halt for this to work
+                                        /sbin/reboot && touch /var/run/shutdown
+                                else
+                                        : # NOP
+                                fi \\
+                        '
+        done
+XSESSIONSCRIPT
+
+}
+
+PrepareX

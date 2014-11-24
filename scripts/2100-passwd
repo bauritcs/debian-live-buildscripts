@@ -1,0 +1,34 @@
+#!/bin/bash
+
+SetRootLogin ()
+{
+
+# Output startup message
+#
+echo -n " setrootpw"
+
+
+# Set password
+#
+echo "root:start" | chpasswd
+#echo "user:start" | chpasswd
+passwd -l user >/dev/null
+
+
+# Make root Password local only
+sed -i -e '/PermitRootLogin/cPermitRootLogin without-password' /etc/ssh/sshd_config
+
+
+# Set Keyfile
+#
+mkdir -p /root/.ssh
+chmod 600 /root/.ssh
+touch /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+
+echo "ssh-rsa SET A PUBLIC KEY HERE" >>/root/.ssh/authorized_keys
+
+}
+
+SetRootLogin
+
